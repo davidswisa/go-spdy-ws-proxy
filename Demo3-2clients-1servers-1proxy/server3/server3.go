@@ -6,8 +6,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/httpstream"
@@ -59,7 +62,7 @@ func (f handlerFactory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer conn.Close()
 
-		serveEcho(conn)
+		serveProxy(conn)
 		return
 	}
 
@@ -73,30 +76,144 @@ func newHybridExecHandler() http.Handler {
 	}}
 }
 
-func serveEcho(conn protocolHandler) {
-	for {
-		channel, payload, err := conn.ReadMessage()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+func serveProxy(client protocolHandler) {
+	backend, err := dialBackendWS("ws://localhost:8081/spdy")
+	if err != nil {
+		log.Printf("backend dial error: %v", err)
+		_ = client.WriteMessage(remotecommand.StreamErr, []byte(fmt.Sprintf("backend dial error: %v", err)))
+		return
+	}
+	defer backend.Close()
+
+	errCh := make(chan error, 2)
+	closeBoth := sync.OnceFunc(func() {
+		_ = backend.Close()
+		_ = client.Close()
+	})
+
+	// client -> backend
+	go func() {
+		defer closeBoth()
+		for {
+			ch, payload, err := client.ReadMessage()
+			if err != nil {
+				errCh <- err
 				return
 			}
-			log.Printf("read error (%s): %v", conn.Name(), err)
-			_ = conn.WriteMessage(remotecommand.StreamErr, []byte(fmt.Sprintf("read error: %v", err)))
-			return
+			if len(payload) == 0 {
+				continue
+			}
+			if err := backend.WriteMessage(ch, payload); err != nil {
+				errCh <- err
+				return
+			}
 		}
-		if channel != remotecommand.StreamStdIn {
-			continue
-		}
-		if len(payload) == 0 {
-			continue
-		}
+	}()
 
-		out := append([]byte("server received: "), payload...)
-		if err := conn.WriteMessage(remotecommand.StreamStdOut, out); err != nil {
-			log.Printf("write stdout error (%s): %v", conn.Name(), err)
-			return
+	// backend -> client
+	go func() {
+		defer closeBoth()
+		for {
+			ch, payload, err := backend.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if len(payload) == 0 {
+				continue
+			}
+			if err := client.WriteMessage(ch, payload); err != nil {
+				errCh <- err
+				return
+			}
 		}
+	}()
+
+	err = <-errCh
+	if err == nil || errors.Is(err, io.EOF) {
+		return
 	}
+	log.Printf("proxy stream ended with error: %v", err)
+}
+
+type backendWSHandler struct {
+	c                   *websocket.Conn
+	supportsCloseSignal bool
+}
+
+func (h *backendWSHandler) Name() string { return "backend-websocket" }
+
+func (h *backendWSHandler) ReadMessage() (byte, []byte, error) {
+	for {
+		mt, data, err := h.c.ReadMessage()
+		if err != nil {
+			return 0, nil, err
+		}
+		if mt != websocket.BinaryMessage {
+			continue
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if h.supportsCloseSignal && data[0] == remotecommand.StreamClose {
+			// Close signal: [255, channel]
+			if len(data) != 2 {
+				continue
+			}
+			// Treat backend half-close as EOF from that stream.
+			return data[1], nil, io.EOF
+		}
+		ch := data[0]
+		payload := make([]byte, len(data)-1)
+		copy(payload, data[1:])
+		return ch, payload, nil
+	}
+}
+
+func (h *backendWSHandler) WriteMessage(channel byte, payload []byte) error {
+	frame := make([]byte, 1+len(payload))
+	frame[0] = channel
+	copy(frame[1:], payload)
+	return h.c.WriteMessage(websocket.BinaryMessage, frame)
+}
+
+func (h *backendWSHandler) Close() error {
+	if h.c != nil {
+		return h.c.Close()
+	}
+	return nil
+}
+
+func dialBackendWS(rawURL string) (protocolHandler, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	d := websocket.Dialer{
+		Proxy: http.ProxyFromEnvironment,
+		Subprotocols: []string{
+			remotecommand.StreamProtocolV5Name,
+			remotecommand.StreamProtocolV4Name,
+			remotecommand.StreamProtocolV3Name,
+			remotecommand.StreamProtocolV2Name,
+			remotecommand.StreamProtocolV1Name,
+		},
+	}
+
+	c, _, err := d.Dial(u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	negotiated := c.Subprotocol()
+	if negotiated == "" {
+		_ = c.Close()
+		return nil, fmt.Errorf("backend did not negotiate a subprotocol")
+	}
+
+	log.Printf("connected to backend ws %s (subprotocol=%s)", u.String(), negotiated)
+	return &backendWSHandler{c: c, supportsCloseSignal: negotiated == remotecommand.StreamProtocolV5Name}, nil
 }
 
 // -----------------------------
