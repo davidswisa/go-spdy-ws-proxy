@@ -23,48 +23,95 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// protocolHandler is a tiny interface so we can route to SPDY vs WebSocket via a factory.
+// protocolHandler represents an upgraded connection (SPDY or WebSocket)
+// with a small common API.
+//
+// ReadMessage returns the next chunk of data from a logical inbound channel.
+// For this demo we primarily read from STDIN (channel 0).
 type protocolHandler interface {
 	Name() string
+	ReadMessage() (channel byte, payload []byte, err error)
+	WriteMessage(channel byte, payload []byte) error
+	Close() error
+}
+
+type protocolUpgrader interface {
+	Name() string
 	CanHandle(*http.Request) bool
-	ServeHTTP(http.ResponseWriter, *http.Request)
+	Upgrade(http.ResponseWriter, *http.Request) (protocolHandler, error)
 }
 
 type handlerFactory struct {
-	handlers []protocolHandler
+	upgraders []protocolUpgrader
 }
 
 func (f handlerFactory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	for _, h := range f.handlers {
-		if h.CanHandle(r) {
-			log.Printf("exec request: protocol=%s method=%s path=%s", h.Name(), r.Method, r.URL.Path)
-			h.ServeHTTP(w, r)
+	for _, u := range f.upgraders {
+		if !u.CanHandle(r) {
+			continue
+		}
+		log.Printf("exec request: upgrader=%s method=%s path=%s", u.Name(), r.Method, r.URL.Path)
+
+		conn, err := u.Upgrade(w, r)
+		if err != nil {
+			log.Printf("upgrade error (%s): %v", u.Name(), err)
 			return
 		}
+		defer conn.Close()
+
+		serveEcho(conn)
+		return
 	}
-	http.Error(w, "no handler for request", http.StatusBadRequest)
+
+	http.Error(w, "no protocol upgrader matched request", http.StatusBadRequest)
 }
 
 func newHybridExecHandler() http.Handler {
-	return handlerFactory{handlers: []protocolHandler{
-		wsRemotecommandHandler{},
-		spdyRemotecommandHandler{},
+	return handlerFactory{upgraders: []protocolUpgrader{
+		wsRemotecommandUpgrader{},
+		spdyRemotecommandUpgrader{},
 	}}
+}
+
+func serveEcho(conn protocolHandler) {
+	for {
+		channel, payload, err := conn.ReadMessage()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			log.Printf("read error (%s): %v", conn.Name(), err)
+			_ = conn.WriteMessage(remotecommand.StreamErr, []byte(fmt.Sprintf("read error: %v", err)))
+			return
+		}
+		if channel != remotecommand.StreamStdIn {
+			continue
+		}
+		if len(payload) == 0 {
+			continue
+		}
+
+		out := append([]byte("server received: "), payload...)
+		if err := conn.WriteMessage(remotecommand.StreamStdOut, out); err != nil {
+			log.Printf("write stdout error (%s): %v", conn.Name(), err)
+			return
+		}
+	}
 }
 
 // -----------------------------
 // WebSocket (remotecommand.NewWebSocketExecutor)
 // -----------------------------
 
-type wsRemotecommandHandler struct{}
+type wsRemotecommandUpgrader struct{}
 
-func (wsRemotecommandHandler) Name() string { return "websocket" }
+func (wsRemotecommandUpgrader) Name() string { return "websocket" }
 
-func (wsRemotecommandHandler) CanHandle(r *http.Request) bool {
+func (wsRemotecommandUpgrader) CanHandle(r *http.Request) bool {
 	return wsstream.IsWebSocketRequest(r)
 }
 
-func (wsRemotecommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (wsRemotecommandUpgrader) Upgrade(w http.ResponseWriter, r *http.Request) (protocolHandler, error) {
 	protocols := map[string]wsstream.ChannelProtocolConfig{}
 	channels := []wsstream.ChannelType{
 		wsstream.ReadChannel,   // 0 stdin
@@ -85,48 +132,78 @@ func (wsRemotecommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	negotiated, rwc, err := conn.Open(w, r)
 	if err != nil {
-		log.Printf("websocket open error: %v", err)
-		return
+		return nil, err
 	}
 	log.Printf("websocket connection established (subprotocol=%s)", negotiated)
 
-	// rwc is indexed by channel.
-	stdin := rwc[remotecommand.StreamStdIn]
-	stdout := rwc[remotecommand.StreamStdOut]
-	stderr := rwc[remotecommand.StreamStdErr]
-	errStream := rwc[remotecommand.StreamErr]
+	return &wsRemotecommandHandler{
+		conn:      conn,
+		stdin:     rwc[remotecommand.StreamStdIn],
+		stdout:    rwc[remotecommand.StreamStdOut],
+		stderr:    rwc[remotecommand.StreamStdErr],
+		errStream: rwc[remotecommand.StreamErr],
+	}, nil
+}
 
-	// For this demo:
-	// - Echo stdin -> stdout.
-	// - Never write stderr.
-	// - Close error stream when stdin closes (signals success).
-	_ = stderr
+type wsRemotecommandHandler struct {
+	conn      *wsstream.Conn
+	stdin     io.ReadWriteCloser
+	stdout    io.ReadWriteCloser
+	stderr    io.ReadWriteCloser
+	errStream io.ReadWriteCloser
+}
 
-	if _, err := io.Copy(stdout, stdin); err != nil && !errors.Is(err, io.EOF) {
-		log.Printf("websocket copy error: %v", err)
-		// best-effort error reporting; client may ignore.
-		_, _ = errStream.Write([]byte(fmt.Sprintf("copy error: %v", err)))
+func (*wsRemotecommandHandler) Name() string { return "websocket" }
+
+func (h *wsRemotecommandHandler) ReadMessage() (byte, []byte, error) {
+	buf := make([]byte, 32*1024)
+	n, err := h.stdin.Read(buf)
+	if n > 0 {
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		return remotecommand.StreamStdIn, payload, nil
 	}
+	return remotecommand.StreamStdIn, nil, err
+}
 
-	_ = stdout.Close()
-	_ = errStream.Close()
-	_ = conn.Close()
+func (h *wsRemotecommandHandler) WriteMessage(channel byte, payload []byte) error {
+	switch channel {
+	case remotecommand.StreamStdOut:
+		_, err := h.stdout.Write(payload)
+		return err
+	case remotecommand.StreamStdErr:
+		_, err := h.stderr.Write(payload)
+		return err
+	case remotecommand.StreamErr:
+		_, err := h.errStream.Write(payload)
+		return err
+	default:
+		return nil
+	}
+}
+
+func (h *wsRemotecommandHandler) Close() error {
+	// Close underlying conn; this will close channels.
+	if h.conn != nil {
+		return h.conn.Close()
+	}
+	return nil
 }
 
 // -----------------------------
 // SPDY (remotecommand.NewSPDYExecutor)
 // -----------------------------
 
-type spdyRemotecommandHandler struct{}
+type spdyRemotecommandUpgrader struct{}
 
-func (spdyRemotecommandHandler) Name() string { return "spdy" }
+func (spdyRemotecommandUpgrader) Name() string { return "spdy" }
 
-func (spdyRemotecommandHandler) CanHandle(r *http.Request) bool {
-	// Anything not WebSocket falls back to SPDY for this demo.
+func (spdyRemotecommandUpgrader) CanHandle(r *http.Request) bool {
+	// Anything not WebSocket falls back to SPDY.
 	return true
 }
 
-func (spdyRemotecommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (spdyRemotecommandUpgrader) Upgrade(w http.ResponseWriter, r *http.Request) (protocolHandler, error) {
 	serverProtocols := []string{
 		remotecommand.StreamProtocolV5Name,
 		remotecommand.StreamProtocolV4Name,
@@ -136,8 +213,7 @@ func (spdyRemotecommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 	negotiated, err := httpstream.Handshake(r, w, serverProtocols)
 	if err != nil {
-		log.Printf("spdy handshake error: %v", err)
-		return
+		return nil, err
 	}
 	log.Printf("spdy handshake negotiated protocol=%s", negotiated)
 
@@ -145,21 +221,80 @@ func (spdyRemotecommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	session := newSPDYSession()
 
 	conn := upgrader.UpgradeResponse(w, r, session.onNewStream)
-	defer conn.Close()
 	log.Printf("spdy connection established")
 
-	<-conn.CloseChan()
-	log.Printf("spdy connection closed")
+	select {
+	case <-session.ready:
+		stdin, stdout, stderr, errStream := session.streamsForIO()
+		return &spdyRemotecommandHandler{
+			conn:      conn,
+			stdin:     stdin,
+			stdout:    stdout,
+			stderr:    stderr,
+			errStream: errStream,
+		}, nil
+	case <-time.After(30 * time.Second):
+		_ = conn.Close()
+		return nil, fmt.Errorf("timed out waiting for spdy streams")
+	}
+}
+
+type spdyRemotecommandHandler struct {
+	conn      httpstream.Connection
+	stdin     httpstream.Stream
+	stdout    httpstream.Stream
+	stderr    httpstream.Stream
+	errStream httpstream.Stream
+}
+
+func (*spdyRemotecommandHandler) Name() string { return "spdy" }
+
+func (h *spdyRemotecommandHandler) ReadMessage() (byte, []byte, error) {
+	buf := make([]byte, 32*1024)
+	n, err := h.stdin.Read(buf)
+	if n > 0 {
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		return remotecommand.StreamStdIn, payload, nil
+	}
+	return remotecommand.StreamStdIn, nil, err
+}
+
+func (h *spdyRemotecommandHandler) WriteMessage(channel byte, payload []byte) error {
+	switch channel {
+	case remotecommand.StreamStdOut:
+		_, err := h.stdout.Write(payload)
+		return err
+	case remotecommand.StreamStdErr:
+		if h.stderr == nil {
+			return nil
+		}
+		_, err := h.stderr.Write(payload)
+		return err
+	case remotecommand.StreamErr:
+		_, err := h.errStream.Write(payload)
+		return err
+	default:
+		return nil
+	}
+}
+
+func (h *spdyRemotecommandHandler) Close() error {
+	if h.conn != nil {
+		return h.conn.Close()
+	}
+	return nil
 }
 
 type spdySession struct {
 	mu      sync.Mutex
 	streams map[string]httpstream.Stream
 	started bool
+	ready   chan struct{}
 }
 
 func newSPDYSession() *spdySession {
-	return &spdySession{streams: make(map[string]httpstream.Stream)}
+	return &spdySession{streams: make(map[string]httpstream.Stream), ready: make(chan struct{})}
 }
 
 func (s *spdySession) onNewStream(stream httpstream.Stream, replySent <-chan struct{}) error {
@@ -174,41 +309,26 @@ func (s *spdySession) onNewStream(stream httpstream.Stream, replySent <-chan str
 
 	s.mu.Lock()
 	s.streams[streamType] = stream
-	canStart := !s.started && s.streams[corev1.StreamTypeError] != nil && s.streams[corev1.StreamTypeStdout] != nil
-	// If the client requested stdin, wait for it so we don't wedge by reading too early.
-	if !s.started && headers.Get(corev1.StreamType) == corev1.StreamTypeStdin {
-		// no-op; stdin presence is handled by the generic readiness check below
-	}
-	// If stdin is expected, ensure it's present before starting.
-	if canStart {
-		if s.streams[corev1.StreamTypeStdin] == nil {
-			canStart = false
-		}
-	}
-	if canStart {
+	if !s.started && s.streams[corev1.StreamTypeError] != nil && s.streams[corev1.StreamTypeStdout] != nil && s.streams[corev1.StreamTypeStdin] != nil {
 		s.started = true
-		stdin := s.streams[corev1.StreamTypeStdin]
-		stdout := s.streams[corev1.StreamTypeStdout]
-		errStream := s.streams[corev1.StreamTypeError]
-		s.mu.Unlock()
-
-		go s.runEcho(stdin, stdout, errStream)
-		return nil
+		select {
+		case <-s.ready:
+			// already closed
+		default:
+			close(s.ready)
+		}
 	}
 	s.mu.Unlock()
 
 	return nil
 }
 
-func (s *spdySession) runEcho(stdin, stdout, errStream httpstream.Stream) {
-	defer func() {
-		_ = stdout.Close()
-		_ = errStream.Close()
-		_ = stdin.Close()
-	}()
-
-	if _, err := io.Copy(stdout, stdin); err != nil && !errors.Is(err, io.EOF) {
-		log.Printf("spdy copy error: %v", err)
-		_, _ = errStream.Write([]byte(fmt.Sprintf("copy error: %v", err)))
-	}
+func (s *spdySession) streamsForIO() (stdin, stdout, stderr, errStream httpstream.Stream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stdin = s.streams[corev1.StreamTypeStdin]
+	stdout = s.streams[corev1.StreamTypeStdout]
+	stderr = s.streams[corev1.StreamTypeStderr]
+	errStream = s.streams[corev1.StreamTypeError]
+	return
 }
