@@ -1,0 +1,126 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
+	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	"k8s.io/apimachinery/pkg/util/remotecommand"
+)
+
+func main() {
+	http.HandleFunc("/spdy", spdyHandler)
+
+	log.Println("SPDY server listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func spdyHandler(w http.ResponseWriter, r *http.Request) {
+	serverProtocols := []string{
+		remotecommand.StreamProtocolV5Name,
+		remotecommand.StreamProtocolV4Name,
+		remotecommand.StreamProtocolV3Name,
+		remotecommand.StreamProtocolV2Name,
+		remotecommand.StreamProtocolV1Name,
+	}
+	negotiated, err := httpstream.Handshake(r, w, serverProtocols)
+	if err != nil {
+		log.Printf("spdy handshake error: %v", err)
+		return
+	}
+	log.Printf("spdy handshake negotiated protocol=%s", negotiated)
+
+	upgrader := spdy.NewResponseUpgrader()
+	session := newSPDYSession()
+
+	conn := upgrader.UpgradeResponse(w, r, session.onNewStream)
+	defer conn.Close()
+
+	log.Println("SPDY connection established")
+
+	select {
+	case <-session.ready:
+		stdin, stdout, _, errStream := session.streamsForIO()
+		go runEcho(stdin, stdout, errStream)
+	case <-time.After(30 * time.Second):
+		log.Printf("timed out waiting for spdy streams")
+		return
+	}
+
+	<-conn.CloseChan()
+	log.Printf("client SPDY connection closed")
+}
+
+type spdySession struct {
+	mu      sync.Mutex
+	streams map[string]httpstream.Stream
+	ready   chan struct{}
+	started bool
+}
+
+func newSPDYSession() *spdySession {
+	return &spdySession{streams: make(map[string]httpstream.Stream), ready: make(chan struct{})}
+}
+
+func (s *spdySession) onNewStream(stream httpstream.Stream, replySent <-chan struct{}) error {
+	_ = replySent
+	headers := stream.Headers()
+	streamType := headers.Get(corev1.StreamType)
+	if streamType == "" {
+		return fmt.Errorf("missing %q header", corev1.StreamType)
+	}
+
+	s.mu.Lock()
+	s.streams[streamType] = stream
+	if !s.started && s.streams[corev1.StreamTypeError] != nil && s.streams[corev1.StreamTypeStdout] != nil && s.streams[corev1.StreamTypeStdin] != nil {
+		s.started = true
+		select {
+		case <-s.ready:
+		default:
+			close(s.ready)
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *spdySession) streamsForIO() (stdin, stdout, stderr, errStream httpstream.Stream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stdin = s.streams[corev1.StreamTypeStdin]
+	stdout = s.streams[corev1.StreamTypeStdout]
+	stderr = s.streams[corev1.StreamTypeStderr]
+	errStream = s.streams[corev1.StreamTypeError]
+	return
+}
+
+func runEcho(stdin, stdout, errStream httpstream.Stream) {
+	defer func() {
+		if stdout != nil {
+			_ = stdout.Close()
+		}
+		if errStream != nil {
+			_ = errStream.Close()
+		}
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+	}()
+
+	if stdin == nil || stdout == nil {
+		return
+	}
+	if _, err := io.Copy(stdout, stdin); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("spdy echo error: %v", err)
+		if errStream != nil {
+			_, _ = errStream.Write([]byte(fmt.Sprintf("echo error: %v", err)))
+		}
+	}
+}
